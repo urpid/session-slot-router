@@ -1,0 +1,3 @@
+name: session-slot-router
+version: 1.0.0
+description: Attach the Hermes session ID to LLM requests targeting port 8081
