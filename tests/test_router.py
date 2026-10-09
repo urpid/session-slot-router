@@ -1,3 +1,4 @@
+import http.client
 import importlib.util
 import json
 import logging
@@ -41,6 +42,14 @@ class UpstreamHandler(BaseHTTPRequestHandler):
         self.paths.append((self.command, self.path))
         if self.path == "/slots":
             self.send_json([{"id": 0}, {"id": 1}])
+        elif self.path == "/close-delimited":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(b"close-delimited")
+            self.close_connection = True
         else:
             self.send_json({"method": self.command, "path": self.path})
 
@@ -198,6 +207,27 @@ class RouterTest(unittest.TestCase):
                     response.read()
         self.assertTrue(all((method, "/probe?x=1") in UpstreamHandler.paths
                             for method in ("GET", "HEAD", "PUT", "PATCH", "DELETE", "OPTIONS")))
+
+    def test_non_chunked_response_preserves_content_length(self):
+        connection = http.client.HTTPConnection("127.0.0.1", self.router.server_port, timeout=1)
+        try:
+            connection.request("GET", "/health")
+            response = connection.getresponse()
+            body = response.read()
+            self.assertEqual(response.getheader("Content-Length"), str(len(body)))
+            self.assertEqual(json.loads(body), {"method": "GET", "path": "/health"})
+        finally:
+            connection.close()
+
+    def test_response_without_length_is_close_delimited(self):
+        connection = http.client.HTTPConnection("127.0.0.1", self.router.server_port, timeout=1)
+        try:
+            connection.request("GET", "/close-delimited")
+            response = connection.getresponse()
+            self.assertEqual(response.getheader("Connection"), "close")
+            self.assertEqual(response.read(), b"close-delimited")
+        finally:
+            connection.close()
 
     def test_lru_cron_forwarding_and_stream(self):
         self.assertEqual(json.loads(self.ask("pi", "a", client_type="cli"))["slot"], 0)

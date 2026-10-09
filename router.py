@@ -201,6 +201,7 @@ class Handler(BaseHTTPRequestHandler):
             status = response.status
             self.send_response_only(status, response.reason)
             chunked = response.getheader("Transfer-Encoding", "").lower() == "chunked"
+            content_length = response.getheader("Content-Length")
             for name, value in response.getheaders():
                 lower = name.lower()
                 if lower in HOP:
@@ -208,6 +209,11 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header(name, value)
             if chunked:
                 self.send_header("Transfer-Encoding", "chunked")
+            elif content_length is not None:
+                self.send_header("Content-Length", content_length)
+            else:
+                self.send_header("Connection", "close")
+                self.close_connection = True
             self.end_headers()
             if self.command != "HEAD":
                 while chunk := response.read1(16384):
