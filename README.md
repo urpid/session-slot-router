@@ -12,7 +12,7 @@
 ## <PROFIL>: Installationsstand
 
 - Das Plugin liegt unter `~/.hermes/profiles/<PROFIL>/plugins/session-slot-router/` (`__init__.py`, `plugin.yaml`); `~/.hermes/profiles/<PROFIL>/config.yaml` enthält `session-slot-router` zusätzlich zu `hermes-session-reset-policy` in `plugins.enabled`.
-- <PROFIL> verwendet `model.provider: custom` mit `base_url: http://gmm:8081/v1`; das Plugin wurde in echten <PROFIL>-Anfragen erkannt und der Router hat deren Session wiederholt demselben Slot zugewiesen.
+- <PROFIL> verwendet `model.provider: custom` mit `base_url: http://127.0.0.1:8081/v1`; das Plugin wurde in echten <PROFIL>-Anfragen erkannt und der Router hat deren Session wiederholt demselben Slot zugewiesen.
 
 ## Grenzen dieser ersten Fassung
 
