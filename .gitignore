@@ -1,3 +1,13 @@
-# Alles sperren – nur .gitignore selbst bleibt versioniert
+# Alles sperren – nur der im SVN versionierte Inhalt wird erlaubt
 *
 !.gitignore
+!LICENSE
+!README.md
+!router.py
+!start-router.sh
+!plugin-hermes/
+!plugin-hermes/**
+!plugin-pi/
+!plugin-pi/**
+!tests/
+!tests/**
