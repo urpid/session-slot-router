@@ -18,8 +18,8 @@ HOP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
 
 
 def routing_key(agent, session):
-    if not isinstance(agent, str) or agent not in {"pi", "hermes"}:
-        raise ValueError("agent must be pi or hermes")
+    if not isinstance(agent, str) or agent not in {"pi", "hermes", "opencode"}:
+        raise ValueError("agent must be pi, hermes or opencode")
     if not isinstance(session, str) or not session or len(session) > 256:
         raise ValueError("nonempty agent_session_id required (maximum 256 characters)")
     return f"{agent}:{session}"
