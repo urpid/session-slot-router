@@ -17,7 +17,8 @@ opencode-Plugin (v2) für den lokalen Session-Slot-Router. Es
 
 ## Voraussetzungen
 
-- opencode v2 (getestet mit 2.0.32)
+- opencode v2 (getestet mit 2.2.0; die Version ohne Start-Polling ist für das
+  Settings-Merge-Verhalten von 2.2.0 erforderlich, siehe Verhalten)
 - Session-Slot-Router unter `http://127.0.0.1:8081` (Projekt-README im
   Ordner `plugin-opencode/` bzw. im Router-Projekt), dessen `agent_name`-
   Whitelist `"opencode"` enthält — sonst lehnt der Router die gerouteten
@@ -65,11 +66,19 @@ opencode-Plugin (v2) für den lokalen Session-Slot-Router. Es
   `/slots` nicht erreichbar), gilt der Output-Fallback `min(n_ctx, 32768)`,
   ebenfalls mit Warnung. Ein unerreichbarer `/v1/models`-Endpunkt führt zu
   null registrierten Modellen (Provider bleibt im TUI sichtbar, ohne Modell).
-- **Start- und Recovery-Verhalten:** Beim Start 20 × 500 ms Retry, solange kein
-  Modell registriert ist. Danach wird alle 60 Sekunden erneut geprüft, **solange
-  das Inventar leer ist** — ein Router, der später neu startet (z. B. bei
-  Modellwechsel), wird ohne manuellen Eingriff wieder aufgenommen. Außerdem
-  wird bei `config.updated`/`provider.updated` neu abgefragt.
+- **Start- und Recovery-Verhalten:** `setup` pollt nicht: opencode 2.2.0 merge
+  die Provider-Settings aus der Config erst ~0,5 s nach der letzten
+  Provider-Aktivität, und jeder `provider.list()`-Call schiebt diesen Merge
+  erneut 0,5 s hinaus — eine Start-Retry-Schleife holt sich die Settings nie
+  und überschreitet die 10-s-Plugin-Aktivierungs-Fenster für ACP
+  `session/new` (Fehler `Internal service failure`). Stattdessen kehrt
+  `setup` sofort zurück und die Modelle werden beim ersten
+  `provider.updated`-Event geholt und registriert (in der Praxis ~0,1–1 s
+  nach dem Verbindungsaufbau). Zusätzlich wird alle 60 Sekunden erneut
+  geprüft, **solange das Inventar leer ist** — ein Router, der später neu
+  startet (z. B. bei Modellwechsel), wird ohne manuellen Eingriff wieder
+  aufgenommen. Außerdem wird bei `config.updated`/`provider.updated` neu
+  abgefragt.
 - **Session-Affinität:** Jede opencode-Session bildet den Routing-Key
   `opencode:<sessions-ID>`. Folgeturns derselben Session erhalten denselben
   llama.cpp-Slot (KV-Cache-Affinität, `action=reuse`); neue Sessions belegen
@@ -87,7 +96,8 @@ opencode-Plugin (v2) für den lokalen Session-Slot-Router. Es
 - `~/.config/opencode/plugins/slot-router/debug.log` (neben der Plugin-Datei):
   - `registered 1 model(s)` / `refresh unchanged (1 model(s))` — Katalog OK
   - `injected agent_session_id for session ses_…` — Affinitäts-Injektion aktiv
-  - Warnungen: `provider slot-router not found …` (Config fehlt/zu früh),
+  - Warnungen: `provider slot-router not found …` (Config fehlt; in 2.2.0
+    kurz nach dem Start temporär, bis der Settings-Merge eingetreten ist),
     `refresh failed: …` (Router down), `… falling back to 32768`
 - `router.log` des Routers: `incoming … agent='opencode' session='ses_…'`,
   `request session='opencode:ses_…' action=assign|reuse|evict`,

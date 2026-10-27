@@ -27,8 +27,6 @@ import { appendFileSync } from "node:fs"
 
 const PROVIDER_ID = "slot-router"
 const REQUEST_TIMEOUT_MS = 5000
-const STARTUP_ATTEMPTS = 20
-const STARTUP_RETRY_MS = 500
 const OUTPUT_FALLBACK_TOKENS = 32768
 const LOG_FILE = "/home/worker/.config/opencode/plugins/slot-router/debug.log"
 
@@ -243,17 +241,17 @@ export default {
     log("setup: registering transform")
     await ctx.provider.transform(transform)
     await ctx.provider.reload()
-    log("setup: initial reload done, starting startup retries")
+    log("setup: initial reload done")
 
-    for (let attempt = 0; attempt < STARTUP_ATTEMPTS && !abort.signal.aborted; attempt++) {
-      await refresh()
-      log(`startup attempt ${attempt + 1}: ${Object.keys(inventory).length} model(s)`) 
-      if (Object.keys(inventory).length > 0) break
-      await new Promise((resolve) => setTimeout(resolve, STARTUP_RETRY_MS))
-    }
-    // The event subscription only covers config/provider changes, not a
-    // router restart. Re-check periodically while the inventory is empty so
-    // a router that comes back later is picked up without a manual nudge.
+    // No polling for the config settings here: in opencode v2.2.0 every
+    // provider.list() call re-arms the core's debounced settings merge for
+    // config-sourced providers, so a startup retry loop starves the very
+    // baseURL we wait for and setup() outlives the 10s ACP plugin-activation
+    // window (session/new -> ServiceUnavailable "Internal service failure").
+    // setup() therefore returns right away; the provider.updated event (fired
+    // once the core applies the config settings, ~0.5s after the last
+    // provider activity) triggers the first refresh and registers the models.
+    // The recheck below covers a router that starts later.
     const recheck = setInterval(() => {
       if (Object.keys(inventory).length === 0) void refresh()
     }, 60000)
