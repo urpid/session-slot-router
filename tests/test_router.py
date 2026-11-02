@@ -3,6 +3,7 @@ import importlib.util
 import json
 import logging
 import io
+import random
 import re
 import subprocess
 import sys
@@ -18,7 +19,18 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from router import LOG, Router, routing_key
+from router import LOG, Router, routing_key, LOOP_NUDGE, LoopDetector, SSEReasoningExtractor
+
+LOOP_PHRASE = "but the CMD is using the system python and I keep saying it "
+
+
+def quiet_handle_error(request, client_address):
+    # Loop tests cut upstream streams early; the resulting resets are expected.
+    # socketserver (3.14+) passes the exception via sys.exc_info().
+    exc = sys.exc_info()[1]
+    if not isinstance(exc, (ConnectionResetError, BrokenPipeError)):
+        import traceback
+        traceback.print_exception(exc)
 
 
 class UpstreamHandler(BaseHTTPRequestHandler):
@@ -28,6 +40,19 @@ class UpstreamHandler(BaseHTTPRequestHandler):
 
     def log_message(self, *_):
         pass
+
+    def _sse(self, parts):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Transfer-Encoding", "chunked")
+        self.end_headers()
+        try:
+            for part in parts:
+                self.wfile.write(f"{len(part):x}\r\n".encode() + part + b"\r\n")
+                self.wfile.flush()
+            self.wfile.write(b"0\r\n\r\n")
+        except (ConnectionResetError, BrokenPipeError):
+            pass  # The router cuts looping streams early; the remaining writes are discarded.
 
     def send_json(self, payload, status=200):
         body = json.dumps(payload).encode()
@@ -57,6 +82,31 @@ class UpstreamHandler(BaseHTTPRequestHandler):
         payload = json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0"))) or b"{}")
         self.calls.append(payload)
         self.paths.append((self.command, self.path))
+        if self.path.endswith("/chat/completions") and payload.get("stream"):
+            messages = payload.get("messages") or []
+            first = messages[0].get("content") if messages and isinstance(messages[0], dict) else None
+            last = messages[-1].get("content") if messages and isinstance(messages[-1], dict) else None
+            loop_chunk = ('data: {"choices":[{"delta":{"reasoning_content":"' + LOOP_PHRASE + '"}}]}\n\n').encode()
+            loop_chunks = [loop_chunk] * 120
+            if first == "loop-then-recover" and last is not None and last != first:
+                self._sse([b'data: {"choices":[{"delta":{"reasoning_content":"short fresh thought"}}]}\n\n',
+                           b'data: {"choices":[{"delta":{"content":"recovered"}}]}\n\n',
+                           b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n',
+                           b"data: [DONE]\n\n"])
+                return
+            if first == last == "loop-then-recover":
+                self._sse(loop_chunks + [b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n',
+                                         b"data: [DONE]\n\n"])
+                return
+            if first == "loop-always":
+                self._sse(loop_chunks + [b"data: [DONE]\n\n"])
+                return
+            if first == "loop-retry-500" and last is not None and last != first:
+                self.send_json({"error": "boom"}, status=500)
+                return
+            if first == last == "loop-retry-500":
+                self._sse(loop_chunks + [b"data: [DONE]\n\n"])
+                return
         if payload.get("stream"):
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
@@ -82,8 +132,10 @@ class RouterTest(unittest.TestCase):
         UpstreamHandler.calls = []
         UpstreamHandler.paths = []
         self.upstream = ThreadingHTTPServer(("127.0.0.1", 0), UpstreamHandler)
+        self.upstream.handle_error = quiet_handle_error
         threading.Thread(target=self.upstream.serve_forever, daemon=True).start()
         self.router = Router(("127.0.0.1", 0), f"http://127.0.0.1:{self.upstream.server_port}", str(Path(self.tmp.name) / "test.sqlite"))
+        self.router.handle_error = quiet_handle_error
         threading.Thread(target=self.router.serve_forever, daemon=True).start()
 
     def tearDown(self):
@@ -93,6 +145,52 @@ class RouterTest(unittest.TestCase):
         self.upstream.shutdown()
         self.upstream.server_close()
         self.tmp.cleanup()
+
+    def _client_stream(self, body, port=None):
+        connection = http.client.HTTPConnection("127.0.0.1", port or self.router.server_port, timeout=15)
+        try:
+            connection.request("POST", "/v1/chat/completions", body=json.dumps(body).encode(),
+                               headers={"Content-Type": "application/json"})
+            response = connection.getresponse()
+            return response.status, response.read()
+        finally:
+            connection.close()
+
+    @staticmethod
+    def _sse_events(body):
+        events = []
+        for line in body.split(b"\n"):
+            line = line.strip()
+            if not line.startswith(b"data:"):
+                continue
+            payload = line[5:].strip()
+            if payload == b"[DONE]":
+                events.append("[DONE]")
+            elif payload:
+                events.append(json.loads(payload))
+        return events
+
+    @classmethod
+    def _finish_stops(cls, events):
+        return [e for e in events if isinstance(e, dict)
+                and e.get("choices") and e["choices"][0].get("finish_reason") == "stop"]
+
+    def _loop_request(self, scenario, **extra):
+        body = {"agent_name": "pi", "agent_session_id": extra.pop("session", "loop"), "stream": True,
+                "messages": [{"role": "user", "content": scenario}], **extra}
+        return self._client_stream(body)
+
+    @staticmethod
+    def _wait_events(db, routing_key, actions, timeout=5.0):
+        """Poll the events table: the client may finish reading the stream before release() commits."""
+        deadline = time.time() + timeout
+        rows = []
+        while time.time() < deadline:
+            rows = db.execute("SELECT action FROM events WHERE routing_key=? ORDER BY id", (routing_key,)).fetchall()
+            if [r[0] for r in rows] == actions:
+                return rows
+            time.sleep(0.05)
+        raise AssertionError(f"events {actions!r} not recorded for {routing_key!r}, got {[r[0] for r in rows]!r}")
 
     def ask(self, agent, sid, **extra):
         body = {"agent_name": agent, "agent_session_id": sid, "id_slot": 99, "messages": ["hello"], **extra}
@@ -176,9 +274,11 @@ class RouterTest(unittest.TestCase):
 
     def test_existing_database_migrates_without_losing_events(self):
         path = Path(self.tmp.name) / "old.sqlite"
-        with sqlite3.connect(path) as db:
-            db.execute("CREATE TABLE events (id INTEGER PRIMARY KEY, at INTEGER NOT NULL, routing_key TEXT, slot INTEGER, action TEXT NOT NULL, status INTEGER)")
-            db.execute("INSERT INTO events(at, routing_key, slot, action, status) VALUES(1, 'pi:old', 0, 'response', 200)")
+        db = sqlite3.connect(path)
+        db.execute("CREATE TABLE events (id INTEGER PRIMARY KEY, at INTEGER NOT NULL, routing_key TEXT, slot INTEGER, action TEXT NOT NULL, status INTEGER)")
+        db.execute("INSERT INTO events(at, routing_key, slot, action, status) VALUES(1, 'pi:old', 0, 'response', 200)")
+        db.commit()
+        db.close()
         upgraded = Router(("127.0.0.1", 0), f"http://127.0.0.1:{self.upstream.server_port}", str(path))
         try:
             self.assertEqual(upgraded.db.execute("SELECT routing_key, client_type FROM events").fetchall(), [("pi:old", None)])
@@ -247,6 +347,155 @@ class RouterTest(unittest.TestCase):
         self.assertEqual([x[0] for x in rows], ["assign", "assign", "reuse", "evict", "evict", "reuse", "reuse", "evict"])
         self.assertEqual(routing_key("hermes", "cron_abcdef123456_20261007_010101"),
                          "hermes:cron_abcdef123456_20261007_010101")
+
+
+    def test_loop_detector_triggers_only_on_repetition(self):
+        detector = LoopDetector(warmup=1000, window=500, ngram=10, ratio=0.5)
+        phrase = "the model keeps repeating this exact sentence again "
+        self.assertFalse(detector.feed(phrase * 15))
+        self.assertTrue(detector.feed(phrase * 15))
+        self.assertTrue(detector.triggered)
+        self.assertIn("unique_ratio=", detector.hit)
+        self.assertIn("top_gram_x", detector.hit)
+        diverse = LoopDetector(warmup=100, window=3000, ngram=18, ratio=0.5)
+        random.seed(7)
+        words = ("alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima "
+                 "mike november oscar papa quebec romeo sierra tango uniform victor "
+                 "seven nine three eight four zero one five six two").split()
+        index = 0
+        for _ in range(300):
+            index += 1
+            text = " ".join(random.choice(words) for _ in range(20))
+            if diverse.feed(text):
+                self.fail(f"false positive at step {index}")
+
+    def test_sse_extractor_pulls_only_reasoning_content(self):
+        extractor = SSEReasoningExtractor()
+        text = extractor.feed(b'data: {"choices":[{"delta":{"reasoning_content":"abc"}}]}\n\n'
+                              b'data: {"choices":[{"delta":{"content":"visible"}}]}\n\n')
+        self.assertEqual(text, "abc")
+        split = extractor.feed(b'data: {"choices":[{"delta":{"reasoning_cont')
+        self.assertEqual(split, "")
+        rest = extractor.feed(b'ent":"de"}}]}\n\n')
+        self.assertEqual(rest, "de")
+
+    def test_loop_detected_cuts_and_retries_with_one_answer(self):
+        status, body = self._loop_request("loop-then-recover", session="loop1")
+        self.assertEqual(status, 200)
+        self.assertIn(b"response cut: model entered a repetition loop", body)
+        self.assertIn(b"recovered", body)
+        events = self._sse_events(body)
+        self.assertEqual(events.count("[DONE]"), 1)
+        self.assertEqual(len(self._finish_stops(events)), 1)
+        reasoning = 0
+        for event in events:
+            if isinstance(event, dict) and event.get("choices"):
+                reasoning += len(event["choices"][0].get("delta", {}).get("reasoning_content", ""))
+        self.assertGreater(reasoning, 3000)
+        calls = [c for c in UpstreamHandler.calls if c.get("stream")]
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[1]["messages"][-1], {"role": "user", "content": LOOP_NUDGE})
+        self.assertEqual(calls[1]["messages"][:-1], calls[0]["messages"])
+        self.assertEqual(calls[1]["id_slot"], calls[0]["id_slot"])
+        self.assertNotIn("agent_session_id", calls[1])
+        self._wait_events(self.router.db, "pi:loop1", ["assign", "loop_cut", "loop_retry", "response"])
+
+    def test_loop_in_retry_is_cut_without_second_retry(self):
+        status, body = self._loop_request("loop-always", session="loop2")
+        self.assertEqual(status, 200)
+        self.assertIn(b"loop persisted after retry", body)
+        events = self._sse_events(body)
+        self.assertEqual(events.count("[DONE]"), 1)
+        self.assertEqual(len(self._finish_stops(events)), 1)
+        self.assertEqual(len([c for c in UpstreamHandler.calls if c.get("stream")]), 2)
+        self._wait_events(self.router.db, "pi:loop2", ["assign", "loop_cut", "loop_retry", "response"])
+
+    def test_loop_detection_applies_to_passthrough_without_session(self):
+        before = self.router.db.execute("SELECT count(*) FROM events").fetchone()[0]
+        status, body = self._client_stream({"stream": True, "messages": [{"role": "user", "content": "loop-then-recover"}]})
+        self.assertEqual(status, 200)
+        self.assertIn(b"response cut: model entered a repetition loop", body)
+        self.assertIn(b"recovered", body)
+        calls = [c for c in UpstreamHandler.calls if c.get("stream")]
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[1]["messages"][-1], {"role": "user", "content": LOOP_NUDGE})
+        self.assertEqual(self.router.db.execute("SELECT count(*) FROM events").fetchone()[0], before)
+
+    def test_loop_observe_mode_never_cuts(self):
+        observer = Router(("127.0.0.1", 0), f"http://127.0.0.1:{self.upstream.server_port}",
+                          str(Path(self.tmp.name) / "observe.sqlite"), loop_cut=False)
+        threading.Thread(target=observer.serve_forever, daemon=True).start()
+        try:
+            status, body = self._client_stream({"agent_name": "pi", "agent_session_id": "loop3", "stream": True,
+                                                "messages": [{"role": "user", "content": "loop-then-recover"}]},
+                                               port=observer.server_port)
+            self.assertEqual(status, 200)
+            self.assertNotIn(b"response cut", body)
+            self.assertEqual(self._sse_events(body).count("[DONE]"), 1)
+            self.assertEqual(len([c for c in UpstreamHandler.calls if c.get("stream")]), 1)
+        finally:
+            observer.shutdown()
+            observer.server_close()
+            observer.db.close()
+
+    def test_loop_cut_only_without_retry(self):
+        cutter = Router(("127.0.0.1", 0), f"http://127.0.0.1:{self.upstream.server_port}",
+                        str(Path(self.tmp.name) / "cutonly.sqlite"), loop_retries=0)
+        threading.Thread(target=cutter.serve_forever, daemon=True).start()
+        try:
+            status, body = self._client_stream({"agent_name": "pi", "agent_session_id": "loop4", "stream": True,
+                                                "messages": [{"role": "user", "content": "loop-then-recover"}]},
+                                               port=cutter.server_port)
+            self.assertEqual(status, 200)
+            self.assertIn(b"response cut: model entered a repetition loop", body)
+            self.assertNotIn(b"recovered", body)
+            events = self._sse_events(body)
+            self.assertEqual(events.count("[DONE]"), 1)
+            self.assertEqual(len(self._finish_stops(events)), 1)
+            self.assertEqual(len([c for c in UpstreamHandler.calls if c.get("stream")]), 1)
+            self._wait_events(cutter.db, "pi:loop4", ["assign", "loop_cut", "response"])
+        finally:
+            cutter.shutdown()
+            cutter.server_close()
+            cutter.db.close()
+
+    def test_loop_retry_upstream_error_is_reported_to_client(self):
+        status, body = self._loop_request("loop-retry-500", session="loop6")
+        self.assertEqual(status, 200)
+        self.assertIn(b"retry failed; no answer available.", body)
+        events = self._sse_events(body)
+        self.assertEqual(events.count("[DONE]"), 1)
+        self.assertEqual(len(self._finish_stops(events)), 1)
+        self.assertEqual(len([c for c in UpstreamHandler.calls if c.get("stream")]), 2)
+
+    def test_loop_parameters_are_validated(self):
+        upstream_url = f"http://127.0.0.1:{self.upstream.server_port}"
+        db = str(Path(self.tmp.name) / "invalid.sqlite")
+        with self.assertRaises(ValueError):
+            Router(("127.0.0.1", 0), upstream_url, db, ngram=1)
+        with self.assertRaises(ValueError):
+            Router(("127.0.0.1", 0), upstream_url, db, ngram=2000)
+        with self.assertRaises(ValueError):
+            Router(("127.0.0.1", 0), upstream_url, db, ratio=0)
+        with self.assertRaises(ValueError):
+            Router(("127.0.0.1", 0), upstream_url, db, nudge="")
+
+    def test_loop_retry_uses_custom_nudge(self):
+        nudger = Router(("127.0.0.1", 0), f"http://127.0.0.1:{self.upstream.server_port}",
+                        str(Path(self.tmp.name) / "nudge.sqlite"), nudge="custom nudge marker")
+        threading.Thread(target=nudger.serve_forever, daemon=True).start()
+        try:
+            status, body = self._client_stream({"agent_name": "pi", "agent_session_id": "loop5", "stream": True,
+                                                "messages": [{"role": "user", "content": "loop-then-recover"}]},
+                                               port=nudger.server_port)
+            self.assertEqual(status, 200)
+            self.assertIn(b"recovered", body)
+            calls = [c for c in UpstreamHandler.calls if c.get("stream")]
+            self.assertEqual(calls[1]["messages"][-1], {"role": "user", "content": "custom nudge marker"})
+        finally:
+            nudger.shutdown()
+            nudger.server_close()
+            nudger.db.close()
 
 
 if __name__ == "__main__":
