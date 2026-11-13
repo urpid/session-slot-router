@@ -37,6 +37,8 @@ class UpstreamHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     calls = []
     paths = []
+    single_slot = threading.Lock()
+    first_disconnected = threading.Event()
 
     def log_message(self, *_):
         pass
@@ -88,6 +90,41 @@ class UpstreamHandler(BaseHTTPRequestHandler):
             last = messages[-1].get("content") if messages and isinstance(messages[-1], dict) else None
             loop_chunk = ('data: {"choices":[{"delta":{"reasoning_content":"' + LOOP_PHRASE + '"}}]}\n\n').encode()
             loop_chunks = [loop_chunk] * 120
+            if first == "single-slot-loop":
+                if last != first:
+                    if not self.single_slot.acquire(timeout=3):
+                        self.send_json({"error": "original request still holds the slot"}, status=503)
+                        return
+                    try:
+                        self._sse([b'data: {"choices":[{"delta":{"content":"recovered"}}]}\n\n',
+                                   b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n', b"data: [DONE]\n\n"])
+                    finally:
+                        self.single_slot.release()
+                    return
+                with self.single_slot:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/event-stream")
+                    self.send_header("Transfer-Encoding", "chunked")
+                    self.end_headers()
+                    part = ("data: " + json.dumps({"choices": [{"delta": {"reasoning_content": " ⇒" * 80}}]}) + "\n\n").encode()
+                    try:
+                        for _ in range(600):
+                            self.wfile.write(f"{len(part):x}\r\n".encode() + part + b"\r\n")
+                            self.wfile.flush()
+                            time.sleep(0.01)
+                    except (ConnectionResetError, BrokenPipeError):
+                        self.first_disconnected.set()
+                return
+            if first == "symbol-loop-then-recover" and last != first:
+                self._sse([b'data: {"choices":[{"delta":{"content":"recovered"}}]}\n\n',
+                           b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n', b"data: [DONE]\n\n"])
+                return
+            if first == last == "symbol-loop-then-recover":
+                parts = [" ⇒" * 80 + " ", "⇒" + " ⇒" * 175]
+                chunks = [("data: " + json.dumps({"choices": [{"delta": {"reasoning_content": part}}]}) + "\n\n").encode()
+                          for part in parts]
+                self._sse(chunks + [b"data: [DONE]\n\n"])
+                return
             if first == "loop-then-recover" and last is not None and last != first:
                 self._sse([b'data: {"choices":[{"delta":{"reasoning_content":"short fresh thought"}}]}\n\n',
                            b'data: {"choices":[{"delta":{"content":"recovered"}}]}\n\n',
@@ -131,6 +168,8 @@ class RouterTest(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         UpstreamHandler.calls = []
         UpstreamHandler.paths = []
+        UpstreamHandler.single_slot = threading.Lock()
+        UpstreamHandler.first_disconnected = threading.Event()
         self.upstream = ThreadingHTTPServer(("127.0.0.1", 0), UpstreamHandler)
         self.upstream.handle_error = quiet_handle_error
         threading.Thread(target=self.upstream.serve_forever, daemon=True).start()
@@ -378,6 +417,47 @@ class RouterTest(unittest.TestCase):
         self.assertEqual(split, "")
         rest = extractor.feed(b'ent":"de"}}]}\n\n')
         self.assertEqual(rest, "de")
+
+    def test_short_pattern_repetition_across_chunks(self):
+        for pattern in (" ⇒", "abc", "abcdefghijklmnop"):
+            with self.subTest(pattern=pattern):
+                detector = LoopDetector(warmup=100000, window=3000, ngram=18, ratio=0.5)
+                self.assertFalse(detector.feed(pattern * 255))
+                self.assertFalse(detector.feed(pattern[:-1]))
+                self.assertTrue(detector.feed(pattern[-1:]))
+                self.assertIn("repeated_pattern_x256", detector.hit)
+
+    def test_short_patterns_do_not_trigger_on_whitespace_or_normal_formatting(self):
+        detector = LoopDetector(warmup=100000, window=3000, ngram=18, ratio=0.5)
+        self.assertFalse(detector.feed(" \n" * 1000))
+        self.assertFalse(detector.feed("-" * 120 + "\n" + "def example():\n    return 42\n" * 5))
+        self.assertFalse(detector.feed("abcdefghijklmnopq" * 256))
+
+    def test_symbol_loop_cuts_and_retries(self):
+        status, body = self._loop_request("symbol-loop-then-recover", session="symbol-loop")
+        self.assertEqual(status, 200)
+        self.assertIn(b"repeated_pattern_x256", body)
+        self.assertIn(b"recovered", body)
+        events = self._sse_events(body)
+        self.assertEqual(events.count("[DONE]"), 1)
+        self.assertEqual(len(self._finish_stops(events)), 1)
+        calls = [c for c in UpstreamHandler.calls if c.get("stream")]
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[1]["messages"][-1], {"role": "user", "content": LOOP_NUDGE})
+        self.assertEqual(calls[1]["id_slot"], calls[0]["id_slot"])
+        self._wait_events(self.router.db, "pi:symbol-loop", ["assign", "loop_cut", "loop_retry", "response"])
+
+    def test_retry_waits_for_original_disconnect_on_single_slot(self):
+        started = time.monotonic()
+        status, body = self._loop_request("single-slot-loop", session="single-slot")
+        self.assertEqual(status, 200)
+        self.assertTrue(UpstreamHandler.first_disconnected.is_set())
+        self.assertIn(b"recovered", body)
+        self.assertLess(time.monotonic() - started, 3)
+        events = self._sse_events(body)
+        self.assertEqual(events.count("[DONE]"), 1)
+        self.assertEqual(len(self._finish_stops(events)), 1)
+        self._wait_events(self.router.db, "pi:single-slot", ["assign", "loop_cut", "loop_retry", "response"])
 
     def test_loop_detected_cuts_and_retries_with_one_answer(self):
         status, body = self._loop_request("loop-then-recover", session="loop1")

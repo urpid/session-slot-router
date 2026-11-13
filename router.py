@@ -5,6 +5,7 @@ import http.client
 import json
 import logging
 import re
+import socket
 import sqlite3
 import threading
 import time
@@ -35,6 +36,8 @@ LOOP_NUDGE = ("Stop: you are repeating the same thoughts in a loop. Do not repea
 class LoopDetector:
     """Statistical thinking-loop detector on streamed reasoning_content.
 
+    Also catches 256 consecutive repetitions of a non-whitespace pattern of
+    1 to 16 characters, without waiting for the statistical warmup.
     After --warmup-chars of raw reasoning text, a sliding window of the last
     --window normalized chars (lowercase, digits and CJK only) is checked every
     ~100 new chars: unique char-level --ngram ratio below --ratio means the
@@ -53,11 +56,25 @@ class LoopDetector:
         self.pending = 0
         self.triggered = False
         self.hit = None
+        self.recent = ""
+        self.pattern_runs = [0] * 16
 
     def feed(self, text):
         """Feed one reasoning_content increment; True when the stream must be cut."""
         if self.triggered:
             return True
+        for char in text:
+            for size in range(1, 17):
+                if len(self.recent) >= size and char == self.recent[-size]:
+                    self.pattern_runs[size - 1] += 1
+                else:
+                    self.pattern_runs[size - 1] = 0
+            self.recent = (self.recent + char)[-16:]
+            for size, run in enumerate(self.pattern_runs, 1):
+                if run >= 255 * size and self.recent[-size:].strip():
+                    self.triggered = True
+                    self.hit = f"repeated_pattern_x256: {self.recent[-size:]!r}"
+                    return True
         self.raw_len += len(text)
         if self.raw_len < self.warmup:
             return False
@@ -346,6 +363,13 @@ class Handler(BaseHTTPRequestHandler):
                             if self.server.loop_cut:
                                 if routed:
                                     self.server.loop_event(key, slot, "loop_cut", client_type)
+                                if upstream.sock is not None:
+                                    try:
+                                        upstream.sock.shutdown(socket.SHUT_RDWR)
+                                    except OSError as exc:
+                                        LOG.info("upstream socket shutdown: %s", exc)
+                                response.close()
+                                upstream.close()
                                 if self.server.loop_retries > 0 and isinstance(data.get("messages"), list):
                                     self.write_chunk(self.sse_content(loop_notice(loop_state["detector"].hit, True)), chunked)
                                     if self.loop_retry(key, slot, client_type, routed, data, headers, chunked):
